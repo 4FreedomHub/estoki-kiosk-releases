@@ -37,7 +37,7 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Build the image
-        run: sudo image/build.sh --tag "$TAG" --out "$RUNNER_TEMP/image"
+        run: sudo bash image/build.sh --tag "$TAG" --out "$RUNNER_TEMP/image"
 
       - name: Attach it to the release
         env:
