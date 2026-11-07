@@ -1,0 +1,35 @@
+# The kiosk's settings, all optional: with no file, a kiosk runs in production, in English, picking
+# the scanner's mode by itself. Copy to /etc/estoki-pi/config.toml (root:estoki, mode 640) to change
+# any.
+# Nothing here is a secret. The kiosk links itself to a home from its own screen, and keeps its
+# sign-in in `device_file`.
+
+# "dev" or "prod": the Firebase project this kiosk belongs to. A dev kiosk says so in its footer.
+environment = "prod"
+
+# The screen's language: "en" or "pt-BR". It can also be switched on the screen.
+language = "en"
+
+# true drops the honey glow on the last-scan card, for anyone who finds movement on screen hard.
+reduce_motion = false
+
+# Where the kiosk keeps its sign-in once linked. Its directory must be writable by the kiosk's user.
+device_file = "/var/lib/estoki-pi/device.json"
+
+[scanner]
+# "auto" (the default): serial when /dev/serial/by-id lists a device, keyboard otherwise, checked
+# again whenever the scanner comes and goes. "serial" for a scanner in USB virtual serial port mode,
+# like the wall unit's Waveshare module; "keyboard" for one that acts as a USB keyboard.
+mode = "auto"
+
+# The scanner's device, read in "serial" and "keyboard" mode ("auto" always picks). Empty picks the
+# first one, which is right when it is the only one plugged in:
+# in serial mode the first /dev/serial/by-id/* entry, in keyboard mode the first
+# /dev/input/by-id/*-event-kbd. Otherwise name it, e.g. in serial mode
+# "/dev/serial/by-id/usb-USBScn_Chip_USBScn_Module_2027300413413333-if00", or in keyboard mode
+# "/dev/input/by-id/usb-Newland_Auto-ID_Scanner-event-kbd".
+device = ""
+
+[screen]
+# Minutes with no touch and no scan before the screen goes dark; a touch or a scan wakes it. 0 never.
+sleep_after_minutes = 5

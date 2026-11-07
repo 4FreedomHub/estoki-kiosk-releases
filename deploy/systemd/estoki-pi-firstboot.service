@@ -1,0 +1,13 @@
+# Runs estoki-pi-firstboot once, after cloud-init has applied the person's Imager settings, and
+# restarts the Pi if it changed anything. Install to /etc/systemd/system/ and enable.
+[Unit]
+Description=Finish setting up a new Estoki kiosk
+ConditionPathExists=!/var/lib/estoki-pi/firstboot-done
+After=local-fs.target cloud-final.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/estoki-pi-firstboot --reboot
+
+[Install]
+WantedBy=multi-user.target

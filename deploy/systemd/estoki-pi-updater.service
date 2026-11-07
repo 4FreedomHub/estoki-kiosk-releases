@@ -1,0 +1,22 @@
+# Installs the newest signed estoki-pi release from GitHub, if there is one. Started by
+# estoki-pi-updater.timer; run it by hand with `sudo systemctl start estoki-pi-updater.service`
+# and read what it did with `journalctl -u estoki-pi-updater`.
+[Unit]
+Description=Install the newest Estoki kiosk release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/estoki-pi/updater.env
+ExecStart=/usr/local/sbin/estoki-pi-update
+CacheDirectory=estoki-pi
+Environment=ESTOKI_PI_PIP_CACHE=/var/cache/estoki-pi/pip
+Environment=PIP_DISABLE_PIP_VERSION_CHECK=1
+# Writes only under /opt/estoki-pi and its cache; restarts the kiosk through systemd's D-Bus.
+ProtectSystem=strict
+ReadWritePaths=/opt/estoki-pi
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+TimeoutStartSec=30min

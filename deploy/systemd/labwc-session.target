@@ -1,0 +1,8 @@
+# Marks the labwc desktop as a graphical session, so user services that are WantedBy
+# graphical-session.target (estoki-pi.service) start with it and stop when it ends. Started and
+# stopped by deploy/labwc/autostart and shutdown. Install to /etc/systemd/user/.
+[Unit]
+Description=labwc desktop session
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target

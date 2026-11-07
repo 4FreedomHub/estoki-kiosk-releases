@@ -1,0 +1,66 @@
+# The Estoki kiosk's SD card image, built for every release of 4FreedomHub/estoki-kiosk-releases.
+#
+# Copied there as .github/workflows/build-image.yml by estoki-pi's Release workflow, with image/
+# and deploy/, in the commit each release is tagged at: change it in estoki-pi, never there.
+# GitHub's arm64 runners are free for public repositories, and the image's programs run natively.
+# Once the image is attached, os-list.json on `main` names it: estokiapp.com/kiosk/os-list.json
+# redirects there, so Imager lists the newest image that finished building.
+
+name: Build the kiosk image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release to build the image for
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-image-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and attach the image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Build the image
+        run: sudo image/build.sh --tag "$TAG" --out "$RUNNER_TEMP/image"
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" --clobber \
+            "$RUNNER_TEMP/image/estoki-kiosk-$TAG.img.xz" \
+            "$RUNNER_TEMP/image/estoki-kiosk-$TAG.json"
+
+      - name: List it in Imager
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 image/os_list.py --image-json "$RUNNER_TEMP/image/estoki-kiosk-$TAG.json" \
+            --out "$RUNNER_TEMP/os-list.json"
+          git fetch --quiet origin main
+          git checkout --quiet -B main origin/main
+          cp "$RUNNER_TEMP/os-list.json" os-list.json
+          git add os-list.json
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "List the $TAG image in Imager"
+            git push --quiet origin main
+          fi

@@ -1,0 +1,9 @@
+// The kiosk's Shut down: its user may turn the Pi off, even with another session open. The kiosk
+// is a systemd user service, which polkit may not count as the active desktop session.
+polkit.addRule(function (action, subject) {
+    if (subject.user == "estoki" &&
+        (action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions")) {
+        return polkit.Result.YES;
+    }
+});

@@ -1,0 +1,423 @@
+#!/usr/bin/python3
+"""
+Installs the newest GitHub release of estoki-pi on this Pi. Run by estoki-pi-updater.timer as root.
+
+Releases are read from the public repository 4FreedomHub/estoki-kiosk-releases with no token. A
+release installs only when its `manifest.json` carries a valid signature (`ssh-keygen -Y verify`,
+namespace `estoki-kiosk-release`) by the key in `allowed_signers`, and the wheel and lock match the
+SHA-256 the manifest names; the download's TLS alone proves nothing about who made it. A release
+that fails either check is skipped like one that fails its smoke test.
+
+Each release goes into /opt/estoki-pi/releases/<tag>/ with a venv of its own: the release's
+requirements.lock (hashed, wheels only), then its wheel. It must pass `estoki-pi --version` and
+`--self-check` before /opt/estoki-pi/current is switched to it, atomically; one that fails is
+never tried again. The previous release is kept for `--rollback`; older ones are deleted.
+Standard library only: it runs before any venv exists.
+
+    estoki-pi-update              install the newest release if it is newer than the current one
+    estoki-pi-update --check      say what would be installed, change nothing
+    estoki-pi-update --rollback   go back to the previous release, and skip the one rolled back from
+
+Settings come from the environment, all optional (EnvironmentFile=-/etc/estoki-pi/updater.env):
+    ESTOKI_PI_REPO           owner/name (default 4FreedomHub/estoki-kiosk-releases)
+    ESTOKI_PI_ALLOWED_SIGNERS  the keys a release may be signed by
+                             (default /usr/local/share/estoki-pi/allowed_signers)
+    ESTOKI_PI_ROOT           install root (default /opt/estoki-pi)
+    ESTOKI_PI_USER           the kiosk's user, whose user service is restarted (default estoki)
+    ESTOKI_PI_PYTHON         the Python 3.13 the venvs are made from (default /usr/bin/python3)
+    ESTOKI_PI_PIP_CACHE      pip's cache, so PySide6 is not downloaded again for every release
+                             (default /var/cache/estoki-pi/pip; hashes are still checked)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+logger = logging.getLogger("estoki-pi-update")
+
+API = "https://api.github.com"
+WHEEL = re.compile(r"^estoki_pi-(\d+)-py3-none-any\.whl$")
+LOCK = "requirements.lock"
+MANIFEST = "manifest.json"
+SIGNATURE = "manifest.json.sig"
+# The signature's namespace, and the identity its key carries in allowed_signers.
+NAMESPACE = "estoki-kiosk-release"
+SIGNER = "estoki-kiosk-release"
+TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SERVICE = "estoki-pi.service"
+RELEASE_FILE = "release.json"  # Written last: a release directory without it is unfinished.
+TIMEOUT = 60
+
+
+def sync_directory(directory: Path) -> None:
+    """Makes a rename or a new file in `directory` survive a power cut."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_durably(path: Path, text: str) -> None:
+    """Replaces `path` in one step, on the card before it returns: the old file or the new survives."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    sync_directory(path.parent)
+
+
+class UpdateError(Exception):
+    """The update cannot go ahead; nothing on the Pi was switched."""
+
+
+class BrokenRelease(UpdateError):
+    """The release is not ours or failed its smoke test. It is skipped from then on."""
+
+
+class RateLimited(UpdateError):
+    """GitHub's 60 unauthenticated calls an hour are spent: try at the next timer."""
+
+
+def fetch(url: str, accept: str) -> bytes:
+    """GET from GitHub, with no credentials: the releases repository is public."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": accept,
+            "User-Agent": "estoki-pi-update",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 429 or (
+            error.code == 403 and error.headers.get("x-ratelimit-remaining") == "0"
+        ):
+            raise RateLimited(f"GitHub's rate limit is spent ({error.code}); next time.") from None
+        raise UpdateError(f"GitHub answered {error.code} for {url}") from None
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise UpdateError(f"GitHub is unreachable: {error}") from None
+
+
+def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """A command whose failure stops the update."""
+    logger.info("Running %s", " ".join(command))
+    return subprocess.run(command, check=True, capture_output=True, text=True, **kwargs)
+
+
+def verify(manifest: bytes, signature: bytes, allowed_signers: Path) -> None:
+    """Raises BrokenRelease unless `signature` is `manifest` signed by an allowed key."""
+    if not allowed_signers.is_file():
+        raise UpdateError(f"{allowed_signers} is missing, so no release can be trusted.")
+    with tempfile.TemporaryDirectory() as directory:
+        signature_path = Path(directory) / SIGNATURE
+        signature_path.write_bytes(signature)
+        command = [
+            "ssh-keygen", "-Y", "verify", "-f", str(allowed_signers),
+            "-I", SIGNER, "-n", NAMESPACE, "-s", str(signature_path),
+        ]  # fmt: skip
+        try:
+            result = subprocess.run(command, input=manifest, capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise UpdateError(f"Could not run ssh-keygen to check the signature: {error}") from None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise BrokenRelease(f"The release's signature does not check out: {detail}")
+
+
+class Updater:
+    def __init__(
+        self,
+        root: Path,
+        repo: str,
+        user: str,
+        python: str,
+        pip_cache: Path,
+        allowed_signers: Path,
+        fetch=fetch,
+        run=run,
+        verify=verify,
+    ) -> None:
+        self.root = root
+        self.releases = root / "releases"
+        self.current = root / "current"
+        self.skipped = root / "skipped-tags"
+        self.repo = repo
+        self.user = user
+        self.python = python
+        self.pip_cache = pip_cache
+        self.allowed_signers = allowed_signers
+        self.fetch = fetch
+        self.run = run
+        self.verify = verify
+
+    # What is there
+
+    def latest_release(self) -> dict:
+        body = self.fetch(f"{API}/repos/{self.repo}/releases/latest", "application/vnd.github+json")
+        return json.loads(body)
+
+    @staticmethod
+    def release_parts(release: dict) -> tuple[str, int, dict, dict]:
+        """`(tag, version code, wheel asset, lock asset)`, or UpdateError if any is missing."""
+        tag = release.get("tag_name", "")
+        if not TAG.match(tag):
+            raise UpdateError(f"The release tag {tag!r} is not a safe directory name.")
+        assets = {asset["name"]: asset for asset in release.get("assets", [])}
+        wheels = [(int(m.group(1)), assets[name]) for name in assets if (m := WHEEL.match(name))]
+        if len(wheels) != 1:
+            raise UpdateError(f"Release {tag} has {len(wheels)} estoki_pi wheels; expected one.")
+        for name in (LOCK, MANIFEST, SIGNATURE):
+            if name not in assets:
+                raise UpdateError(f"Release {tag} has no {name}.")
+        code, wheel = wheels[0]
+        return tag, code, wheel, assets[LOCK]
+
+    def signed_manifest(self, release: dict, tag: str, code: int, wheel: dict, lock: dict) -> dict:
+        """
+        The release's manifest, once its signature checks out and it names this tag, version and
+        files. Raises BrokenRelease when it doesn't.
+        """
+        assets = {asset["name"]: asset for asset in release["assets"]}
+        manifest = self.fetch(assets[MANIFEST]["url"], "application/octet-stream")
+        signature = self.fetch(assets[SIGNATURE]["url"], "application/octet-stream")
+        self.verify(manifest, signature, self.allowed_signers)
+        try:
+            data = json.loads(manifest)
+            named = (data["tag"], data["code"], data["wheel"]["name"], data["lock"]["name"])
+            hashes = (data["wheel"]["sha256"], data["lock"]["sha256"])
+        except (ValueError, KeyError, TypeError):
+            raise BrokenRelease(f"Release {tag}'s manifest is signed but not readable.") from None
+        if named != (tag, code, wheel["name"], lock["name"]) or not all(
+            isinstance(digest, str) and len(digest) == 64 for digest in hashes
+        ):
+            raise BrokenRelease(f"Release {tag}'s manifest is for another release: {named}.")
+        return data
+
+    def installed(self) -> dict | None:
+        """The current release's record, or None on a Pi with nothing installed yet."""
+        record = self.current / RELEASE_FILE
+        try:
+            return json.loads(record.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def skip(self, tag: str) -> None:
+        """Never install `tag` again; a newer release still installs."""
+        write_durably(self.skipped, "\n".join(sorted(self.skipped_tags() | {tag})) + "\n")
+
+    def skipped_tags(self) -> set[str]:
+        try:
+            return set(self.skipped.read_text().split())
+        except OSError:
+            return set()
+
+    # Doing it
+
+    def update(self, check_only: bool = False) -> int:
+        release = self.latest_release()
+        tag, code, wheel, lock = self.release_parts(release)
+        installed = self.installed()
+        installed_code = installed["version_code"] if installed else 0
+        if tag in self.skipped_tags():
+            logger.info("Release %s was rolled back from; skipping it.", tag)
+            return 0
+        if code <= installed_code:
+            logger.info("Up to date: release %s is %d, installed is %d.", tag, code, installed_code)
+            return 0
+        if check_only:
+            logger.info("Would install release %s (%d) over %d.", tag, code, installed_code)
+            return 0
+
+        previous = self.current.resolve() if installed else None
+        try:
+            manifest = self.signed_manifest(release, tag, code, wheel, lock)
+            wheel = wheel | {"sha256": manifest["wheel"]["sha256"]}
+            lock = lock | {"sha256": manifest["lock"]["sha256"]}
+            target = self.install(tag, code, wheel, lock)
+        except BrokenRelease:
+            self.skip(tag)
+            raise
+        self.switch(target)
+        logger.info("Installed release %s (%d).", tag, code)
+        self.restart()
+        self.prune(keep={target.name} | ({previous.name} if previous else set()))
+        return 0
+
+    def install(self, tag: str, code: int, wheel: dict, lock: dict) -> Path:
+        target = self.releases / tag
+        if target.exists():
+            shutil.rmtree(target)
+        dist = target / "dist"
+        dist.mkdir(parents=True)
+        try:
+            wheel_path = self.download(wheel, dist)
+            lock_path = self.download(lock, dist)
+            venv = target / "venv"
+            pip = [
+                str(venv / "bin" / "python"),
+                "-m",
+                "pip",
+                "--disable-pip-version-check",
+                "--cache-dir",
+                str(self.pip_cache),
+                "install",
+                "--no-input",
+            ]
+            self.run([self.python, "-m", "venv", str(venv)])
+            self.run([*pip, "--only-binary=:all:", "--require-hashes", "-r", str(lock_path)])
+            self.run([*pip, "--no-deps", str(wheel_path)])
+            self.smoke_test(venv, code)
+        except (UpdateError, subprocess.SubprocessError, OSError) as error:
+            shutil.rmtree(target, ignore_errors=True)
+            if isinstance(error, UpdateError):
+                raise
+            detail = (getattr(error, "stderr", None) or "").strip()[-2000:]
+            raise UpdateError(f"Installing {tag} failed: {error}\n{detail}".strip()) from None
+        record = {
+            "tag": tag,
+            "version_code": code,
+            "installed_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        }
+        # The venv reaches the card before the record that marks it finished, and the record before
+        # `current` points at it: a power cut at any moment leaves the old release running.
+        os.sync()
+        write_durably(target / RELEASE_FILE, json.dumps(record, indent=2) + "\n")
+        return target
+
+    def download(self, asset: dict, directory: Path) -> Path:
+        """The asset, saved, once its SHA-256 is the one the signed manifest names."""
+        data = self.fetch(asset["url"], "application/octet-stream")
+        if hashlib.sha256(data).hexdigest() != asset["sha256"]:
+            raise BrokenRelease(f"{asset['name']} does not match the signed manifest.")
+        path = directory / asset["name"]
+        path.write_bytes(data)
+        return path
+
+    def smoke_test(self, venv: Path, code: int) -> None:
+        command = str(venv / "bin" / "estoki-pi")
+        environment = os.environ | {"QT_QPA_PLATFORM": "offscreen", "QML_DISABLE_DISK_CACHE": "1"}
+        try:
+            version = self.run([command, "--version"], timeout=60).stdout
+            if not version.startswith(f"estoki-pi {code} "):
+                raise BrokenRelease(f"The new release says {version.strip()!r}, not {code}.")
+            self.run([command, "--self-check"], env=environment, timeout=120)
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or "").strip()[-2000:]
+            raise BrokenRelease(f"The new release failed its smoke test:\n{detail}") from None
+        except subprocess.TimeoutExpired:
+            raise BrokenRelease("The new release's smoke test did not finish.") from None
+
+    def switch(self, target: Path) -> None:
+        """Points `current` at `target` in one rename, so the kiosk never sees a half-switch."""
+        staging = self.root / ".current.new"
+        if staging.is_symlink() or staging.exists():
+            staging.unlink()
+        staging.symlink_to(target.relative_to(self.root))
+        os.replace(staging, self.current)
+        sync_directory(self.root)
+
+    def restart(self) -> None:
+        """Restarts the kiosk if it is running; otherwise it starts on the next desktop login."""
+        try:
+            self.run(["systemctl", "--user", f"--machine={self.user}@", "try-restart", SERVICE])
+        except (subprocess.CalledProcessError, OSError) as error:
+            logger.warning(
+                "Could not restart %s for %s (%s); the new release starts at the next login.",
+                SERVICE,
+                self.user,
+                error,
+            )
+
+    def prune(self, keep: set[str]) -> None:
+        for path in self.releases.iterdir():
+            if path.is_dir() and path.name not in keep:
+                logger.info("Removing the old release %s", path.name)
+                # Unfinished first, so a power cut halfway never leaves it a --rollback target.
+                (path / RELEASE_FILE).unlink(missing_ok=True)
+                sync_directory(path)
+                shutil.rmtree(path, ignore_errors=True)
+
+    def rollback(self) -> int:
+        installed = self.installed()
+        if installed is None:
+            raise UpdateError("Nothing is installed to roll back from.")
+        current = self.current.resolve()
+        candidates = []
+        for path in self.releases.iterdir():
+            record = path / RELEASE_FILE
+            if path.resolve() != current and record.is_file():
+                candidates.append((json.loads(record.read_text())["installed_at"], path))
+        if not candidates:
+            raise UpdateError("There is no previous release to roll back to.")
+        _, target = max(candidates)
+        self.switch(target)
+        self.skip(installed["tag"])
+        logger.info(
+            "Rolled back from %s to %s; %s will not be installed again.",
+            installed["tag"],
+            target.name,
+            installed["tag"],
+        )
+        self.restart()
+        return 0
+
+
+def main(argv: list[str] | None = None, environ: dict[str, str] | None = None) -> int:
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(description="Install the newest estoki-pi release.")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--check", action="store_true", help="say what would happen only")
+    action.add_argument("--rollback", action="store_true", help="go back to the previous release")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    root = Path(environ.get("ESTOKI_PI_ROOT", "/opt/estoki-pi"))
+    updater = Updater(
+        root=root,
+        repo=environ.get("ESTOKI_PI_REPO", "4FreedomHub/estoki-kiosk-releases"),
+        user=environ.get("ESTOKI_PI_USER", "estoki"),
+        python=environ.get("ESTOKI_PI_PYTHON", "/usr/bin/python3"),
+        pip_cache=Path(environ.get("ESTOKI_PI_PIP_CACHE", "/var/cache/estoki-pi/pip")),
+        allowed_signers=Path(
+            environ.get("ESTOKI_PI_ALLOWED_SIGNERS", "/usr/local/share/estoki-pi/allowed_signers")
+        ),
+    )
+    (root / "releases").mkdir(parents=True, exist_ok=True)
+    with open(root / ".update.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info("Another update is running.")
+            return 0
+        try:
+            return updater.rollback() if args.rollback else updater.update(check_only=args.check)
+        except RateLimited as error:
+            logger.info("%s", error)
+            return 0
+        except UpdateError as error:
+            logger.error("%s", error)
+            return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

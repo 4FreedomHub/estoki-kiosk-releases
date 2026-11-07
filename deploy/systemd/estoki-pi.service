@@ -1,0 +1,24 @@
+# The kiosk screen, as a systemd *user* service of the `estoki` user, started with its desktop
+# session. Install to /etc/systemd/user/ and enable once, as that user:
+#   systemctl --user enable estoki-pi.service
+# The desktop session must reach graphical-session.target; deploy/labwc/autostart does that.
+[Unit]
+Description=Estoki kiosk screen
+Documentation=https://github.com/4FreedomHub/estoki-pi
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+# Keep restarting however often it fails: a kiosk with no screen is worse than a crash loop.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/opt/estoki-pi/current/venv/bin/estoki-pi
+Environment=QT_QPA_PLATFORM=wayland
+Environment=ESTOKI_PI_CONFIG=/etc/estoki-pi/config.toml
+# WAYLAND_DISPLAY and XDG_RUNTIME_DIR come from the session, imported by the labwc autostart.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

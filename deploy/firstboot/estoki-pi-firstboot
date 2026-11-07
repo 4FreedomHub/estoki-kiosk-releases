@@ -1,0 +1,46 @@
+#!/bin/bash
+# What a new kiosk does once, on its first boot, after cloud-init has applied the person's Imager
+# settings. With --reboot it restarts the Pi when it changed anything, since both apply on boot.
+#
+# - The desktop logs the kiosk's user in by itself, whoever else the person's settings created.
+# - A Raspberry Pi 5's bootloader is told its supply gives 5 A (PSU_MAX_CURRENT=5000); without it a
+#   Pi 5 on PoE or another maker's supply limits USB to 600 mA and warns on the desktop. A value
+#   the person set is left alone.
+set -euo pipefail
+
+KIOSK_USER=${ESTOKI_PI_USER:-estoki}
+MARK=${ESTOKI_PI_FIRSTBOOT_MARK:-/var/lib/estoki-pi/firstboot-done}
+LIGHTDM_CONF=${ESTOKI_PI_LIGHTDM_CONF:-/etc/lightdm/lightdm.conf}
+EEPROM_CONFIG=${ESTOKI_PI_EEPROM_CONFIG:-rpi-eeprom-config}
+
+reboot=false
+[ "${1:-}" = "--reboot" ] && reboot=true
+changed=false
+
+if [ -e "$LIGHTDM_CONF" ] && ! grep -qx "autologin-user=$KIOSK_USER" "$LIGHTDM_CONF"; then
+    edited=$(awk -v user="$KIOSK_USER" '/^#?autologin-user=/ { print "autologin-user=" user; next } { print }' "$LIGHTDM_CONF")
+    printf '%s\n' "$edited" > "$LIGHTDM_CONF"
+    echo "The desktop logs $KIOSK_USER in again."
+    changed=true
+fi
+
+if command -v "$EEPROM_CONFIG" >/dev/null 2>&1; then
+    current=$("$EEPROM_CONFIG")
+    if grep -q '^PSU_MAX_CURRENT=' <<<"$current"; then
+        echo "The bootloader already has $(grep '^PSU_MAX_CURRENT=' <<<"$current")."
+    else
+        new=$(mktemp)
+        trap 'rm -f "$new"' EXIT
+        printf '%s\nPSU_MAX_CURRENT=5000\n' "$current" > "$new"
+        "$EEPROM_CONFIG" --apply "$new"
+        echo "Set PSU_MAX_CURRENT=5000."
+        changed=true
+    fi
+fi
+
+mkdir -p "$(dirname "$MARK")"
+: > "$MARK"
+if $changed && $reboot; then
+    echo "Restarting so the changes apply."
+    systemctl reboot
+fi

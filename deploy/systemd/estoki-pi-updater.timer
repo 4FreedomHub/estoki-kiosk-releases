@@ -1,0 +1,12 @@
+# Checks GitHub for a newer estoki-pi release shortly after boot, then every hour.
+[Unit]
+Description=Check for a newer Estoki kiosk release
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

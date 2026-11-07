@@ -1,0 +1,5 @@
+# The Touch Display 2 (DSI-2, 720 x 1280) turned to landscape for the case; touch follows it.
+# The kiosk user's ~/.config/kanshi/config, the file Control Centre -> Screens writes.
+profile {
+	output DSI-2 enable scale 1.000000 mode 720x1280@60.038 position 0,0 transform 90
+}

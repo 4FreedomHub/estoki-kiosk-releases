@@ -1,0 +1,2 @@
+# The `estoki` user's ~/.config/labwc/shutdown: run when labwc exits, so the kiosk stops with it.
+systemctl --user stop labwc-session.target
