@@ -60,5 +60,5 @@ journalctl -u estoki-pi-updater -e                  # what the updater did
 sudo estoki-pi-update --check                       # what it would do
 sudo estoki-pi-update --rollback                    # back to the previous release, and stay there
 systemctl --user status estoki-pi                   # as estoki: the kiosk
-journalctl --user -u estoki-pi -e                   # as estoki: the kiosk's log
+sudo journalctl _SYSTEMD_USER_UNIT=estoki-pi.service -e   # the kiosk's log (it is in the system journal)
 ```
