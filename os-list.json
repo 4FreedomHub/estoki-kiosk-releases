@@ -5,12 +5,12 @@
       "description": "Raspberry Pi OS with the Estoki kiosk: your household's stock and what to use first, on a Raspberry Pi 5 with the Touch Display 2 and a barcode scanner.",
       "icon": "https://estokiapp.com/kiosk/icon.png",
       "website": "https://estokiapp.com/kiosk/",
-      "url": "https://github.com/4FreedomHub/estoki-kiosk-releases/releases/download/v5-charmeleon/estoki-kiosk-v5-charmeleon.img.xz",
+      "url": "https://github.com/4FreedomHub/estoki-kiosk-releases/releases/download/v6-charizard/estoki-kiosk-v6-charizard.img.xz",
       "extract_size": 7818182656,
-      "extract_sha256": "5bfdf3dc0dfbf7591ecc09e8491fef0fd996bd2ef13e681d70fdecd112a1543b",
-      "image_download_size": 1506910212,
-      "image_download_sha256": "063d012fe07e938059662f74d0491d5eaa74a2112d40d79b399032d5d60466d0",
-      "release_date": "2026-11-11",
+      "extract_sha256": "82198e47bb8e4ed808718925c942cb619aa45f4de80eca60cda30b745a75a49f",
+      "image_download_size": 1506126668,
+      "image_download_sha256": "600ddf29c4680013887a511136fee3fd175d3180e6605d69034b41128f8e8f99",
+      "release_date": "2026-11-12",
       "init_format": "cloudinit-rpi",
       "devices": [
         "pi5-64bit"
